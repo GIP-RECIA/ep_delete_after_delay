@@ -12,6 +12,92 @@ var epVersion = parseFloat(require('ep_etherpad-lite/package.json').version);
 var usePromises = epVersion >= 1.8
 var getHTML, getPad, listAllPads, doesPadExist;
 
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Helper: récupère les emails des admins d'un pad (pad -> group -> group.admins -> users)
+function getAdminsEmailsForPad(padId, cb) {
+    var storage = require('ep_mypads/storage.js');
+    var PPREFIX = storage.DBPREFIX.PAD;
+    var GPREFIX = storage.DBPREFIX.GROUP;
+    var UPREFIX = storage.DBPREFIX.USER;
+
+    storage.db.get(PPREFIX + padId, function(err, pad) {
+        if (err || !pad) return cb(err || null, []);
+        if (!pad.group) return cb(null, []);
+
+        storage.db.get(GPREFIX + pad.group, function(err, group) {
+            if (err || !group) return cb(err || null, []);
+            var adminUids = group.admins || [];
+            if (adminUids.length === 0) return cb(null, []);
+
+            // Récupération séquentielle des utilisateurs
+            var emails = [];
+            var pending = adminUids.length;
+
+            adminUids.forEach(function(uid) {
+                storage.db.get(UPREFIX + uid, function(err, user) {
+                    if (!err && user && user.email) {
+                        emails.push(user.email);
+                    }
+                    pending--;
+                    if (pending === 0) {
+                        return cb(null, emails);
+                    }
+                });
+            });
+        });
+    });
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Notification HTTP -> build JSON puis POST vers l'event-emitter
+const NOTIF_ENDPOINT = 'http://localhost:8179/event/emit';
+const NOTIF_API_KEY  = 'RmBNhP1OyLwLaCAQLPxWvvMYs9LWT8k2';
+const notifBuilder = require('../../src/bin/plugins/lib/notificationBuilder.js'); // path depuis node_modules/ep_delete_after_delay
+
+function sendServiceEventToEndpoint(targetEmail, padId, cb) {
+  try {
+    const event = notifBuilder.buildServiceEvent(
+      'PADS',
+      ['WEB'],
+      'Pad bientôt expiré: ' + padId,
+      'Le pad ' + padId + ' va expirer dans moins de 10 jours.',
+      '/p/' + padId,
+      targetEmail,
+    );
+
+    const body = JSON.stringify(event);
+    const url = require('url').parse(NOTIF_ENDPOINT);
+    const http = url.protocol === 'https:' ? require('https') : require('http');
+
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.path,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'x-api-key': NOTIF_API_KEY
+      },
+      timeout: 10000
+    };
+
+    const req = http.request(opts, function(res) {
+      var resp = '';
+      res.setEncoding('utf8');
+      res.on('data', function(chunk){ resp += chunk; });
+      res.on('end', function(){ cb(null, { statusCode: res.statusCode, body: resp }); });
+    });
+
+    req.on('error', function(err){ cb(err); });
+    req.on('timeout', function(){ req.destroy(new Error('timeout')); });
+
+    req.write(body);
+    req.end();
+  } catch (e) { cb(e); }
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 var removePad = padManager.removePad
 
@@ -150,9 +236,37 @@ function delete_old_pads() {
                                 });
                             });
                         } else {
-                            logger.debug('Nothing to do with '+padId+' (not expired)');
+                            //----------------------------------------------------------------------------------------------------------------------------------------------------------
+                            if (currentTime - timestamp > (delay ) * 1000 ) {
+                            logger.info('Envoie de notification pour le pad %s, il expire dans moins de 10 jours', pad.id);
+
+                            getAdminsEmailsForPad(pad.id, function(err, emails) {
+                                if (err) {
+                                    logger.error('Error while fetching admins emails for pad %s: %s', pad.id, err);
+                                    return;
+                                }
+                                if (!emails || emails.length === 0) {
+                                    logger.info('No admin email found for pad %s, skipping notification', pad.id);
+                                    return;
+                                }
+
+                                logger.info('Sending notification to %s for pad %s', emails.join(', '), pad.id);
+
+                                emails.forEach(function(email) {
+                                    sendServiceEventToEndpoint(email, pad.id, function(err, response) {
+                                        if (err) {
+                                            logger.error('Error while sending notification for pad %s to email %s: %j', pad.id, email, err.message || err);
+                                        } else {
+                                            logger.info('Notification sent for pad %s to email %s: %s', pad.id, email, response.statusCode);
+                                        }
+                                    });
+                                });
+                            
+                            });
                         }
                     }
+                    //--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                }
                 });
             } else {
                 logger.debug('New or empty pad '+padId);
