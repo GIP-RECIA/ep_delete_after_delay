@@ -4,9 +4,46 @@ var API             = require('ep_etherpad-lite/node/db/API'),
   settings          = require('ep_etherpad-lite/node/utils/Settings'),
   async             = require('ep_etherpad-lite/node_modules/async'),
   fs                = require('fs');
+  path              = require('path');
 
 const log4js = require('ep_etherpad-lite/node_modules/log4js');
 const logger = log4js.getLogger('ep_delete_after_delay');
+
+function loadEnv() {
+    const envPath = path.resolve(__dirname, '../../.env');
+    
+    if (!fs.existsSync(envPath)) {
+        logger.warn('Fichier .env introuvable à la racine : %s', envPath);
+        return;
+    }
+
+    try {
+        const content = fs.readFileSync(envPath, 'utf8');
+        content.split('\n').forEach(function(line) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return;
+
+            const equalIndex = trimmed.indexOf('=');
+            if (equalIndex !== -1) {
+                const key = trimmed.substring(0, equalIndex).trim();
+                let value = trimmed.substring(equalIndex + 1).trim();
+                value = value.replace(/^['"](.*)['"]$/, '$1');
+
+                if (!process.env[key]) {
+                    process.env[key] = value;
+                }
+            }
+        });
+        logger.info('.env chargé avec succès depuis la racine');
+    } catch (err) {
+        logger.error('Erreur lors de la lecture du .env : %s', err.message);
+    }
+}
+
+loadEnv();
+
+const NOTIF_ENDPOINT = process.env.API_NOTIFICATION_URL || '';
+const NOTIF_API_KEY  = process.env.API_KEY_NOTIFICATION || '';
 
 var epVersion = parseFloat(require('ep_etherpad-lite/package.json').version);
 var usePromises = epVersion >= 1.8
@@ -40,7 +77,7 @@ function getAdminsEmailsForPad(padId, cb) {
                     }
                     pending--;
                     if (pending === 0) {
-                        return cb(null, emails);
+                        return cb(null, emails, pad.group);
                     }
                 });
             });
@@ -51,18 +88,16 @@ function getAdminsEmailsForPad(padId, cb) {
 
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Notification HTTP -> build JSON puis POST vers l'event-emitter
-const NOTIF_ENDPOINT = 'http://localhost:8179/event/emit';
-const NOTIF_API_KEY  = 'RmBNhP1OyLwLaCAQLPxWvvMYs9LWT8k2';
 const notifBuilder = require('../../src/bin/plugins/lib/notificationBuilder.js'); // path depuis node_modules/ep_delete_after_delay
 
-function sendServiceEventToEndpoint(targetEmail, padId, cb) {
+function sendServiceEventToEndpoint(targetEmail, padId, padGroup, cb) {
   try {
     const event = notifBuilder.buildServiceEvent(
-      'PADS',
-      ['WEB'],
-      'Pad bientôt expiré: ' + padId,
-      'Le pad ' + padId + ' va expirer dans moins de 10 jours.',
-      '/p/' + padId,
+      'MyPads',
+      ['WEB', 'MAIL', 'PUSH'],
+      'Expiration imminente',
+      'Votre pad va expirer dans moins de 10 jours. Pour le garder, accédez-y et modifiez-le',
+      'mypads/?/mypads/group/' + padGroup + '/pad/view/' + padId,
       targetEmail,
     );
 
@@ -136,7 +171,7 @@ if (areParamsOk) {
     areParamsOk = (typeof loopDelay === 'number' && loopDelay > 0) ? true : false;
     if (areParamsOk === false) {
         logger.error('ep_delete_after_delay.loopDelay must be a number an not negative! Check you settings.json.');
-    }
+    }600319
 } else {
     logger.error('You need to configure ep_delete_after_delay in your settings.json!');
 }
@@ -237,10 +272,12 @@ function delete_old_pads() {
                             });
                         } else {
                             //----------------------------------------------------------------------------------------------------------------------------------------------------------
-                            if (currentTime - timestamp > (delay ) * 1000 ) {
+                            if (currentTime - timestamp > (delay - 864000) * 1000 && currentTime - timestamp <= (delay - 860400) * 1000) {
+                            // if qui permet de tester en élargissant la fenêtre de notification à 5 jours au lieu d'une heure.
+                            //if (currentTime - timestamp > 50 * 86400 * 1000 && currentTime - timestamp <= 55 * 86400 * 1000) {
                             logger.info('Envoie de notification pour le pad %s, il expire dans moins de 10 jours', pad.id);
 
-                            getAdminsEmailsForPad(pad.id, function(err, emails) {
+                            getAdminsEmailsForPad(pad.id, function(err, emails, padGroup) {
                                 if (err) {
                                     logger.error('Error while fetching admins emails for pad %s: %s', pad.id, err);
                                     return;
@@ -253,7 +290,7 @@ function delete_old_pads() {
                                 logger.info('Sending notification to %s for pad %s', emails.join(', '), pad.id);
 
                                 emails.forEach(function(email) {
-                                    sendServiceEventToEndpoint(email, pad.id, function(err, response) {
+                                    sendServiceEventToEndpoint(email, pad.id, padGroup, function(err, response) {
                                         if (err) {
                                             logger.error('Error while sending notification for pad %s to email %s: %j', pad.id, email, err.message || err);
                                         } else {
@@ -264,10 +301,10 @@ function delete_old_pads() {
                             
                             });
                         }
-                    }
                     //--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                    }
                 }
-                });
+            });
             } else {
                 logger.debug('New or empty pad '+padId);
             }
